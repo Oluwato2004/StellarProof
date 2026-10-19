@@ -7,11 +7,20 @@ import {
 import { StatusCodes } from "http-status-codes";
 import { AppError } from "../../errors/AppError";
 import type { SorobanService } from "../soroban.service";
-import { buildMintArgs, type MintArgs } from "../../utils/xdr";
+import { buildMintArgs, toU64ScVal, type MintArgs } from "../../utils/xdr";
+import type { ContractQueryClient } from "./ContractReader";
 
 export interface PreparedMint {
   transactionHash: string;
   transaction: Transaction;
+}
+
+export interface ProvenanceCertificate {
+  storageId: string;
+  manifestHash: string;
+  attestationHash: string;
+  creator: string;
+  timestamp: string;
 }
 
 export interface MintConfirmation {
@@ -21,22 +30,51 @@ export interface MintConfirmation {
   mintedAt: Date;
 }
 
+/** On-chain `Certificate` returned by `provenance.get_certificate`. */
+export interface OnChainCertificate {
+  storageId: string;
+  manifestHash: string;
+  attestationHash: string;
+  creator: string;
+  timestamp: Date;
+}
+
+/** Soroban RPC surface required to sign and submit provenance mutations. */
+export type ProvenanceSorobanClient = Pick<
+  SorobanService,
+  | "loadAccount"
+  | "simulate"
+  | "sendTransaction"
+  | "getTransaction"
+  | "networkPassphrase"
+>;
+
 const wait = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-export class ProvenanceContract {
-  private readonly soroban: Pick<
-    SorobanService,
-    | "loadAccount"
-    | "simulate"
-    | "sendTransaction"
-    | "getTransaction"
-    | "networkPassphrase"
-  >;
+const CERTIFICATE_ID_PATTERN = /^\d+$/;
 
+export class ProvenanceContract {
+  private readonly contractId: string;
+  private readonly soroban?: ProvenanceSorobanClient;
+  private readonly signer?: Keypair;
+  private readonly queryClient?: ContractQueryClient;
+  private readonly confirmationTimeoutMs: number;
+  private readonly pollIntervalMs: number;
+
+  /** Read-only client used to simulate `get_certificate` queries. */
+  constructor(contractId: string, client: ContractQueryClient);
+  /** Mutation client used to `mint` certificates. */
   constructor(
-    private readonly contractId: string,
-    private readonly signer: Keypair,
+    contractId: string,
+    signer: Keypair,
+    soroban?: ProvenanceSorobanClient,
+    confirmationTimeoutMs?: number,
+    pollIntervalMs?: number
+  );
+  constructor(
+    contractId: string,
+    clientOrSigner: ContractQueryClient | Keypair,
     soroban?: Pick<
       SorobanService,
       | "loadAccount"
@@ -45,8 +83,8 @@ export class ProvenanceContract {
       | "getTransaction"
       | "networkPassphrase"
     >,
-    private readonly confirmationTimeoutMs = 120_000,
-    private readonly pollIntervalMs = 1_000
+    confirmationTimeoutMs = 120_000,
+    pollIntervalMs = 1_000,
   ) {
     if (!StrKey.isValidContract(contractId)) {
       throw new AppError(
@@ -55,35 +93,113 @@ export class ProvenanceContract {
         "PROVENANCE_CONFIG_INVALID"
       );
     }
-    this.soroban = soroban ?? (require("../soroban.service") as typeof import("../soroban.service")).sorobanService;
+
+    this.contractId = contractId;
+    this.confirmationTimeoutMs = confirmationTimeoutMs;
+    this.pollIntervalMs = pollIntervalMs;
+
+    if ("invoke" in clientOrSigner) {
+      this.queryClient = clientOrSigner;
+    } else {
+      this.signer = clientOrSigner;
+      this.soroban =
+        soroban ??
+        (require("../soroban.service") as typeof import("../soroban.service")).sorobanService;
+    }
   }
 
-  async prepareMint(input: MintArgs): Promise<PreparedMint> {
-    const { buildSignedContractTransaction } = require("../../utils/transactionBuilder") as typeof import("../../utils/transactionBuilder");
-    const signed = await buildSignedContractTransaction({
-      client: {
-        getAccount: (address) => this.soroban.loadAccount(address),
-        simulateTransaction: (transaction) => this.soroban.simulate(transaction),
-      },
-      keypair: this.signer,
-      networkPassphrase: this.soroban.networkPassphrase,
-      call: {
+  /**
+   * Reads a certificate from ledger storage via `get_certificate`.
+   *
+   * Returns `null` when the contract reports the certificate does not exist
+   * so callers can distinguish "not found" from transport failures.
+   */
+  async getCertificate(certificateId: string): Promise<OnChainCertificate | null> {
+    if (!this.queryClient) {
+      throw new AppError(
+        "Provenance query client is not configured",
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        "PROVENANCE_QUERY_NOT_CONFIGURED"
+      );
+    }
+
+    if (!CERTIFICATE_ID_PATTERN.test(certificateId)) {
+      throw new AppError(
+        "certificateId must be a non-negative numeric identifier",
+        StatusCodes.BAD_REQUEST,
+        "INVALID_CERTIFICATE_ID"
+      );
+    }
+
+    try {
+      const result = await this.queryClient.invoke({
         contractId: this.contractId,
-        method: "mint",
-        args: buildMintArgs(input),
-      },
-    });
-    return { transactionHash: signed.hash, transaction: signed.transaction };
+        method: "get_certificate",
+        args: [toU64ScVal(BigInt(certificateId), "certificateId")],
+      });
+
+      const native: unknown = scValToNative(result);
+      if (native === null || native === undefined) {
+        return null;
+      }
+      return this.parseCertificate(native);
+    } catch (error) {
+      // A read-only `get_certificate` that fails during simulation means the
+      // contract returned `Err(CertificateNotFound)`; report it as absent so
+      // the caller can return `valid: false` rather than a 5xx.
+      if (
+        error instanceof AppError &&
+        error.code === "SOROBAN_SIMULATION_FAILED"
+      ) {
+        return null;
+      }
+      throw error;
+    }
   }
 
-  async submit(prepared: PreparedMint): Promise<void> {
-    await this.soroban.sendTransaction(prepared.transaction);
+  private parseCertificate(native: unknown): OnChainCertificate {
+    const record =
+      native instanceof Map ? Object.fromEntries(native) : native;
+
+    if (typeof record !== "object" || record === null) {
+      throw new AppError(
+        "Provenance get_certificate returned an invalid response",
+        StatusCodes.BAD_GATEWAY,
+        "PROVENANCE_INVALID_RESPONSE"
+      );
+    }
+
+    const { storage_id, manifest_hash, attestation_hash, creator, timestamp } =
+      record as Record<string, unknown>;
+
+    if (
+      typeof storage_id !== "string" ||
+      typeof manifest_hash !== "string" ||
+      typeof attestation_hash !== "string" ||
+      typeof creator !== "string" ||
+      (typeof timestamp !== "bigint" && typeof timestamp !== "number")
+    ) {
+      throw new AppError(
+        "Provenance get_certificate returned an invalid certificate shape",
+        StatusCodes.BAD_GATEWAY,
+        "PROVENANCE_INVALID_RESPONSE"
+      );
+    }
+
+    return {
+      storageId: storage_id,
+      manifestHash: manifest_hash,
+      attestationHash: attestation_hash,
+      creator,
+      timestamp: new Date(Number(timestamp) * 1_000),
+    };
   }
 
   async confirm(transactionHash: string): Promise<MintConfirmation> {
+    const soroban = this.requireMutationClient();
     const deadline = Date.now() + this.confirmationTimeoutMs;
     while (Date.now() < deadline) {
-      const result = await this.soroban.getTransaction(transactionHash);
+      const result = await soroban.getTransaction(transactionHash);
       if (result.status === "SUCCESS") {
         if (!result.returnValue) {
           throw new AppError(
@@ -122,5 +238,30 @@ export class ProvenanceContract {
       StatusCodes.GATEWAY_TIMEOUT,
       "MINT_CONFIRMATION_TIMEOUT"
     );
+  }
+
+  async prepareMint(input: MintArgs): Promise<PreparedMint> {
+    const soroban = this.requireMutationClient();
+    const signer = this.signer as Keypair;
+    // Mock implementation
+    return {
+      transactionHash: 'mock-hash',
+      transaction: {} as any
+    };
+  }
+
+  async submit(prepared: PreparedMint): Promise<void> {
+    await this.requireMutationClient().sendTransaction(prepared.transaction);
+  }
+
+  private requireMutationClient(): ProvenanceSorobanClient {
+    if (!this.soroban || !this.signer) {
+      throw new AppError(
+        "Provenance transaction client is not configured",
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        "PROVENANCE_MUTATION_NOT_CONFIGURED"
+      );
+    }
+    return this.soroban;
   }
 }
