@@ -7,6 +7,7 @@
  * preventing silent misconfiguration at request time.
  */
 import "dotenv/config";
+import { StrKey } from "@stellar/stellar-sdk";
 
 function requireEnv(key: string): string {
   const value = process.env[key];
@@ -21,12 +22,51 @@ function optionalEnv(key: string, fallback: string): string {
   return process.env[key] ?? fallback;
 }
 
+function requirePositiveIntEnv(key: string): number {
+  const raw = requireEnv(key);
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    console.error(`[Config] ${key} must be a positive integer, got "${raw}"`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function requireContractId(key: string): string {
+  const value = requireEnv(key);
+  if (!StrKey.isValidContract(value)) {
+    console.error(`[Config] ${key} must be a valid Stellar contract ID (C...)`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function requireSecretSeed(key: string): string {
+  const value = requireEnv(key);
+  if (!StrKey.isValidEd25519SecretSeed(value)) {
+    console.error(`[Config] ${key} must be a valid Stellar Ed25519 secret seed (S...)`);
+    process.exit(1);
+  }
+  return value;
+}
+
 function optionalPositiveIntEnv(key: string, fallback: number): number {
   const raw = process.env[key];
   if (raw === undefined || raw === "") return fallback;
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
     console.error(`[Config] ${key} must be a positive integer, got "${raw}"`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function optionalNonNegativeIntEnv(key: string, fallback: number): number {
+  const raw = process.env[key];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    console.error(`[Config] ${key} must be a non-negative integer, got "${raw}"`);
     process.exit(1);
   }
   return value;
@@ -84,6 +124,18 @@ export const env = {
    */
   STELLAR_NFT_BALANCE_FN: optionalEnv("STELLAR_NFT_BALANCE_FN", "balance"),
 
+
+  /**
+   * Canonical Soroban contract pipeline configuration.
+   * These values are required because the oracle/registry/provenance workers
+   * cannot safely start without validated contract identities and signer input.
+   */
+  ORACLE_CONTRACT_ID: requireContractId("ORACLE_CONTRACT_ID"),
+  PROVENANCE_CONTRACT_ID: requireContractId("PROVENANCE_CONTRACT_ID"),
+  REGISTRY_CONTRACT_ID: requireContractId("REGISTRY_CONTRACT_ID"),
+  ORACLE_SECRET_KEY: requireSecretSeed("ORACLE_SECRET_KEY"),
+  BASE_FEE: requirePositiveIntEnv("BASE_FEE"),
+
   /** Contract addresses, signers, and event ingestion settings. */
   STELLAR_REGISTRY_CONTRACT_ID: optionalEnv("STELLAR_REGISTRY_CONTRACT_ID", ""),
   STELLAR_ORACLE_CONTRACT_ID: optionalEnv("STELLAR_ORACLE_CONTRACT_ID", ""),
@@ -100,6 +152,25 @@ export const env = {
     "STELLAR_TX_CONFIRMATION_TIMEOUT_MS",
     120_000
   ),
+  
+  /** Oracle code measurement hash for TEE verification */
+  ORACLE_CODE_MEASUREMENT_HASH: optionalEnv("ORACLE_CODE_MEASUREMENT_HASH", ""),
+  
+  /** Verification worker configuration */
+  VERIFICATION_WORKER_POLL_INTERVAL_MS: optionalPositiveIntEnv("VERIFICATION_WORKER_POLL_INTERVAL_MS", 5000),
+  VERIFICATION_WORKER_BATCH_SIZE: optionalPositiveIntEnv("VERIFICATION_WORKER_BATCH_SIZE", 10),
+  VERIFICATION_WORKER_MAX_ATTEMPTS: optionalPositiveIntEnv("VERIFICATION_WORKER_MAX_ATTEMPTS", 3),
+  VERIFICATION_WORKER_RETRY_BASE_MS: optionalPositiveIntEnv("VERIFICATION_WORKER_RETRY_BASE_MS", 1000),
+  VERIFICATION_WORKER_LEASE_MS: optionalPositiveIntEnv("VERIFICATION_WORKER_LEASE_MS", 300000),
+  
+  /** SPV verification configuration */
+  SPV_FETCH_TIMEOUT_MS: optionalPositiveIntEnv("SPV_FETCH_TIMEOUT_MS", 15000),
+  SPV_MAX_MEDIA_BYTES: optionalPositiveIntEnv("SPV_MAX_MEDIA_BYTES", 100 * 1024 * 1024),
+  SPV_MAX_MANIFEST_BYTES: optionalPositiveIntEnv("SPV_MAX_MANIFEST_BYTES", 10 * 1024 * 1024),
+  
+  /** Stellar transaction polling configuration */
+  STELLAR_TX_POLL_INTERVAL_MS: optionalPositiveIntEnv("STELLAR_TX_POLL_INTERVAL_MS", 1000),
+  STELLAR_TX_MAX_CONSECUTIVE_RPC_ERRORS: optionalPositiveIntEnv("STELLAR_TX_MAX_CONSECUTIVE_RPC_ERRORS", 5),
 
   /** Allowed CORS origin for the frontend. */
   CORS_ORIGIN: optionalEnv("CORS_ORIGIN", "http://localhost:3000"),

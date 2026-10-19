@@ -39,6 +39,14 @@ export class AttestationService {
     keypair: Keypair,
     codeMeasurementHash: string
   ): Attestation {
+    return this.createAttestationWithHash(input, keypair, codeMeasurementHash);
+  }
+
+  createAttestationWithHash(
+    input: AttestationInput,
+    keypair: Keypair,
+    codeMeasurementHash: string
+  ): Attestation {
     const measurement = assertHex32(codeMeasurementHash, "codeMeasurementHash");
 
     const attestationHash = generateDeterministicHash({
@@ -56,18 +64,6 @@ export class AttestationService {
     const signature = keypair.sign(Buffer.from(attestationHash, "hex")).toString("hex");
 
     return { attestationHash, signature, codeMeasurementHash: measurement };
-  }
-
-  /**
-   * Legacy method: Create an attestation with a provided code measurement hash (deprecated)
-   * Use createAttestationWithTEEConfig() for new code to ensure database-backed hashes
-   */
-  createAttestation(
-    input: AttestationInput,
-    keypair: Keypair,
-    codeMeasurementHash: string
-  ): Attestation {
-    return this.createAttestationWithHash(input, keypair, codeMeasurementHash);
   }
 }
 

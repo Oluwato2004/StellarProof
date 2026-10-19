@@ -6,6 +6,7 @@ import Asset from '../models/Asset.model';
 import Manifest from '../models/Manifest.model';
 import { assetService } from '../services/asset.service';
 import { storageOrchestratorService } from '../services/storage.service';
+import { contentHashService } from '../services/contentHash.service';
 import { StorageError, type StorageProvider } from '../types/storage.types';
 
 /**
@@ -228,10 +229,10 @@ export const uploadManifest = async (req: Request, res: Response, next: NextFunc
       assetId,
       // Manifests are content-addressed on IPFS; never fall back
       allowFallback: false,
-      metadata: {
-        manifestId: manifest._id.toString(),
-        manifestHash: manifest.manifestHash || '',
-      },
+      // metadata: {
+      //   manifestId: manifest._id.toString(),
+      //   manifestHash: manifest.manifestHash || '',
+      // },
     });
 
     manifest.ipfsCid = uploadResult.cid;
